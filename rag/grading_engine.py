@@ -1,3 +1,4 @@
+import json
 from .groq_client import GroqClient
 
 GRADING_SYSTEM_PROMPT = """
@@ -19,14 +20,7 @@ GRADING_SYSTEM_PROMPT = """
 - تأكد من صحة الناتج.
 - تأكد أن الخطوات منطقية.
 
-أخرج النتيجة بصيغة JSON فقط بالشكل التالي:
-
-{
-  "score": 0-100,
-  "is_correct": true/false,
-  "feedback": "شرح مختصر",
-  "correct_answer": "الإجابة النموذجية الصحيحة"
-}
+أخرج النتيجة بصيغة JSON فقط بدون أي شرح إضافي.
 """
 
 class GradingEngine:
@@ -47,4 +41,14 @@ class GradingEngine:
 
         result_text = self.llm.generate(GRADING_SYSTEM_PROMPT, user_prompt)
 
-        return result_text
+        # ✅ تحويل النص إلى JSON فعلي
+        try:
+            return json.loads(result_text)
+        except json.JSONDecodeError:
+            return {
+                "score": 0,
+                "is_correct": False,
+                "feedback": "تعذر تحليل نتيجة التصحيح من النموذج.",
+                "correct_answer": model_answer,
+                "raw_output": result_text
+            }
