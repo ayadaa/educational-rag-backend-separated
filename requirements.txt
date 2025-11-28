@@ -7,3 +7,5 @@ python-dotenv
 tqdm
 torch
 transformers
+python-jose[cryptography]
+passlib[argon2]
