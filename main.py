@@ -1,6 +1,6 @@
 from typing import List, Optional, Literal, Dict, Any
 from datetime import timedelta
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
@@ -15,6 +15,10 @@ from rag.google_oauth import (
     get_google_login_url,
     exchange_code_for_token,
     get_google_user_info,
+)
+from rag.file_processor import (
+    extract_text_from_image_google,
+    extract_text_from_pdf_google
 )
 
 
@@ -300,6 +304,36 @@ def ask(req: QuestionRequest, current_user: Dict[str, Any] = Depends(get_current
     }
 
 
+@app.post("/ask_file")
+async def ask_from_file(
+    subject: str,
+    grade: str,
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        extracted_text = extract_text_from_image_google(file_bytes)
+
+    elif filename.endswith(".pdf"):
+        extracted_text = extract_text_from_pdf_google(file_bytes)
+
+    else:
+        raise HTTPException(400, "Unsupported file type")
+
+    answer, sources = rag.answer(extracted_text, subject, grade)
+
+    return {
+        "question_extracted": extracted_text,
+        "subject": subject,
+        "grade": grade,
+        "answer": answer,
+        "sources": sources,
+    }
+
+
 # ============ توليد الامتحان (مدرّس فقط) ============
 
 @app.post("/generate_exam", response_model=GeneratedExam)
@@ -467,6 +501,39 @@ def submit_exam(
     student_records.add_exam_result(student_id, result)
 
     return result
+
+
+@app.post("/submit_answer_file")
+async def submit_answer_from_file(
+    question: str,
+    model_answer: str,
+    file: UploadFile = File(...),
+    current_student: Dict[str, Any] = Depends(get_current_student),
+):
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        student_answer_text = extract_text_from_image_google(file_bytes)
+
+    elif filename.endswith(".pdf"):
+        student_answer_text = extract_text_from_pdf_google(file_bytes)
+
+    else:
+        raise HTTPException(400, "Unsupported file type")
+
+    grading_result = grading_engine.grade(
+        question=question,
+        student_answer=student_answer_text,
+        model_answer=model_answer,
+    )
+
+    return {
+        "question": question,
+        "student_answer_extracted": student_answer_text,
+        "model_answer": model_answer,
+        "grading_result": grading_result,
+    }
 
 
 # ============ سجل الطالب ============

@@ -10,3 +10,6 @@ transformers
 python-jose[cryptography]
 passlib[argon2]
 httpx
+google-cloud-vision
+pdfplumber
+python-multipart
