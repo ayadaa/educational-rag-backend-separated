@@ -16,6 +16,9 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_ME_SECRET_KEY")  # غيّرها
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # يوم كامل
 
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+REFRESH_TOKENS_FILE = os.path.join(BASE_DIR, "refresh_tokens.json")
+
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 
@@ -65,9 +68,83 @@ class UserManager:
         if not pwd_context.verify(password, user["hashed_password"]):
             return None
         return user
+    
+    def get_or_create_google_user(self, email: str) -> dict:
+        data = self._load()
+
+        if email in data:
+            return data[email]
+
+        user = {
+            "username": email,
+            "hashed_password": None,
+            "role": "student",
+            "created_at": datetime.utcnow().isoformat(),
+            "auth_provider": "google",
+        }
+
+        data[email] = user
+        self._save(data)
+        return user
+
+
+class RefreshTokenManager:
+    def __init__(self):
+        if not os.path.exists(REFRESH_TOKENS_FILE):
+            with open(REFRESH_TOKENS_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+
+    def _load(self):
+        with open(REFRESH_TOKENS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save(self, data):
+        with open(REFRESH_TOKENS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def create_refresh_token(self, username: str) -> str:
+        data = self._load()
+
+        token = jwt.encode(
+            {
+                "sub": username,
+                "type": "refresh",
+                "exp": datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+            },
+            SECRET_KEY,
+            algorithm=ALGORITHM,
+        )
+
+        data[token] = {
+            "username": username,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+        self._save(data)
+        return token
+
+    def verify_refresh_token(self, token: str) -> Optional[str]:
+        data = self._load()
+
+        if token not in data:
+            return None
+
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            if payload.get("type") != "refresh":
+                return None
+            return payload.get("sub")
+        except JWTError:
+            return None
+
+    def revoke_user_tokens(self, username: str):
+        data = self._load()
+        data = {k: v for k, v in data.items() if v["username"] != username}
+        self._save(data)
 
 
 user_manager = UserManager()
+refresh_token_manager = RefreshTokenManager()
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

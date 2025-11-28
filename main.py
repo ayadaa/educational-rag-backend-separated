@@ -1,5 +1,5 @@
 from typing import List, Optional, Literal, Dict, Any
-
+from datetime import timedelta
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -9,7 +9,14 @@ from rag.config import SUBJECTS, GRADES
 from rag.grading_engine import GradingEngine
 from rag.exam_engine import ExamEngine
 from rag.student_record import StudentRecordManager
+from rag.token_blacklist import TokenBlacklist
 from rag.auth import user_manager, create_access_token, decode_token
+from rag.google_oauth import (
+    get_google_login_url,
+    exchange_code_for_token,
+    get_google_user_info,
+)
+
 
 app = FastAPI(
     title="Educational RAG API",
@@ -26,12 +33,20 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    # ✅ تحقق إن كان التوكن ملغي (logout)
+    if token_blacklist.is_revoked(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked (logged out)",
+        )
+
     payload = decode_token(token)
     if not payload or "sub" not in payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
         )
+
     username = payload["sub"]
     user = user_manager.get_user(username)
     if not user:
@@ -39,6 +54,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
+
     return user
 
 
@@ -66,6 +82,7 @@ rag = RAGPipeline()
 grading_engine = GradingEngine()
 exam_engine = ExamEngine()
 student_records = StudentRecordManager()
+token_blacklist = TokenBlacklist()
 
 
 # ============ موديلات عامة ============
@@ -145,14 +162,99 @@ def register(req: RegisterRequest):
     )
 
 
-@app.post("/login", response_model=TokenResponse)
+from rag.auth import refresh_token_manager
+@app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = user_manager.verify_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
 
-    token = create_access_token({"sub": user["username"], "role": user["role"]})
-    return TokenResponse(access_token=token)
+    access_token = create_access_token(
+        {"sub": user["username"], "role": user["role"]},
+        expires_delta=timedelta(minutes=15),  # ✅ قصير
+    )
+
+    refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+
+# =========== Google OAuth Endpoints ============
+
+@app.get("/auth/google/login")
+def google_login():
+    return {
+        "login_url": get_google_login_url()
+    }
+
+
+@app.get("/auth/google/callback")
+async def google_callback(code: str):
+    token_data = await exchange_code_for_token(code)
+    access_token = token_data["access_token"]
+
+    user_info = await get_google_user_info(access_token)
+    email = user_info.get("email")
+
+    if not email:
+        raise HTTPException(400, "Google account has no email")
+
+    user = user_manager.get_or_create_google_user(email)
+
+    jwt_access = create_access_token(
+        {"sub": user["username"], "role": user["role"]},
+        expires_delta=timedelta(minutes=15),
+    )
+
+    refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+
+    return {
+        "access_token": jwt_access,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "username": user["username"],
+            "role": user["role"],
+        }
+    }
+
+
+@app.post("/refresh")
+def refresh_token(refresh_token: str):
+    username = refresh_token_manager.verify_refresh_token(refresh_token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = user_manager.get_user(username)
+
+    new_access_token = create_access_token(
+        {"sub": user["username"], "role": user["role"]},
+        expires_delta=timedelta(minutes=15),
+    )
+
+    return {
+        "access_token": new_access_token,
+        "token_type": "bearer"
+    }
+
+
+@app.post("/logout")
+def logout(
+    token: str = Depends(oauth2_scheme),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    token_blacklist.revoke(token)
+    
+    # ✅ إلغاء كل Refresh Tokens لهذا المستخدم
+    refresh_token_manager.revoke_user_tokens(current_user["username"])
+
+    return {
+        "message": "تم تسجيل الخروج نهائيًا من جميع الجلسات ✅"
+    }
 
 
 @app.get("/me", response_model=UserPublic)
