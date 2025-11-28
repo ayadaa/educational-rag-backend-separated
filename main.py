@@ -5,8 +5,9 @@ from pydantic import BaseModel
 
 from rag.rag_pipeline import RAGPipeline
 from rag.grading_engine import GradingEngine
-from rag.config import SUBJECTS, GRADES
 from rag.exam_engine import ExamEngine
+from rag.student_record import StudentRecordManager
+from rag.config import SUBJECTS, GRADES
 
 app = FastAPI(
     title="Educational RAG API",
@@ -22,6 +23,10 @@ app = FastAPI(
 rag = RAGPipeline()
 grading_engine = GradingEngine()
 exam_engine = ExamEngine()
+student_records = StudentRecordManager()
+
+
+# ====== موديلات الأسئلة ======
 
 class QuestionRequest(BaseModel):
     question: str
@@ -58,6 +63,7 @@ class StudentAnswer(BaseModel):
 
 
 class ExamSubmission(BaseModel):
+    student_id: str
     exam: GeneratedExam
     answers: List[StudentAnswer]
 
@@ -281,10 +287,31 @@ def submit_exam(submission: ExamSubmission):
 
     exam_score = total_score / question_count
 
-    return {
-        "subject": exam.subject,
-        "grade": exam.grade,
-        "num_questions": question_count,
-        "total_score": exam_score,
-        "questions": per_question_results,
+    result = {
+    "subject": exam.subject,
+    "grade": exam.grade,
+    "num_questions": question_count,
+    "total_score": exam_score,
+    "questions": per_question_results,
     }
+
+    # ✅ حفظ النتيجة في سجل الطالب
+    student_id = submission.dict().get("student_id", "anonymous")
+    student_records.add_exam_result(student_id, result)
+
+    return result
+
+
+# ====== عرض سجل الطالب ======
+
+@app.get("/student/{student_id}")
+def get_student_record(student_id: str):
+    record = student_records.get_student_record(student_id)
+    if not record:
+        raise HTTPException(404, "Student not found")
+    return record
+
+
+@app.get("/student/{student_id}/stats")
+def get_student_stats(student_id: str):
+    return student_records.get_student_stats(student_id)

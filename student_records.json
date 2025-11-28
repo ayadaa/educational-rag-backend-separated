@@ -1,0 +1,37 @@
+{
+  "student_001": {
+    "student_id": "student_001",
+    "created_at": "2025-11-28T11:35:30.439908",
+    "exams": [
+      {
+        "timestamp": "2025-11-28T11:35:30.439908",
+        "subject": "physics",
+        "grade": "grade6",
+        "num_questions": 2,
+        "total_score": 60.0,
+        "questions": [
+          {
+            "question_id": 1,
+            "type": "mcq",
+            "question": "ما هو قانون نيوتن الثاني؟",
+            "student_answer": "القوة تساوي الكتلة في التسارع",
+            "model_answer": "القوة تساوي حاصل ضرب الكتلة في التسارع F = m × a.",
+            "score": 100,
+            "is_correct": true,
+            "feedback": "إجابة صحيحة."
+          },
+          {
+            "question_id": 2,
+            "type": "open",
+            "question": "اشرح العلاقة بين القوة والكتلة والتسارع.",
+            "student_answer": "القوة تساوي الكتلة في التسارع",
+            "model_answer": "القوة تتناسب طرديًا مع الكتلة والتسارع...",
+            "score": 20,
+            "is_correct": false,
+            "feedback": "الإجابة الصحيحة هي أن القوة تتناسب طرديًا مع الكتلة والتسارع، وليس تساويها."
+          }
+        ]
+      }
+    ]
+  }
+}
