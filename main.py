@@ -23,6 +23,7 @@ from rag.file_processor import (
 )
 from rag.math_ocr import image_to_latex
 from rag.groq_client import GroqClient
+from rag.math_step_grader import MathStepGrader
 
 
 app = FastAPI(
@@ -91,6 +92,7 @@ exam_engine = ExamEngine()
 student_records = StudentRecordManager()
 token_blacklist = TokenBlacklist()
 math_llm = GroqClient()
+math_step_grader = MathStepGrader()
 
 
 # ============ موديلات عامة ============
@@ -152,6 +154,12 @@ class UserPublic(BaseModel):
     username: str
     role: str
     created_at: str
+
+
+class MathStepsRequest(BaseModel):
+    question: str
+    correct_answer: str
+    student_steps: List[str]
 
 
 # ============ Endpoints الحسابات ============
@@ -318,34 +326,34 @@ async def ask_from_file(
     file_bytes = await file.read()
     filename = file.filename.lower()
 
-    # لو كانت صورة → استخدم GCV + pix2tex معًا
     if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        rich = extract_rich_from_image_google(
-            file_bytes,
-            enable_math=True if subject.lower() in ["math", "physics"] else False
-        )
+        rich = extract_rich_from_image_google(file_bytes)
         extracted_text = rich["merged"]
 
-    # لو PDF → نكتفي بنص GCV من الـ PDF
     elif filename.endswith(".pdf"):
         extracted_text = extract_text_from_pdf_google(file_bytes)
+        rich = {
+            "detected_type": "text",
+            "used_pix2tex": False,
+            "latex": None,
+        }
 
     else:
         raise HTTPException(400, "Unsupported file type")
 
     if not extracted_text:
-        raise HTTPException(400, "لم يتم التعرف على أي نص من الملف المرفوع.")
+        raise HTTPException(400, "لم يتم التعرف على أي نص من الملف.")
 
     answer, sources = rag.answer(extracted_text, subject, grade)
 
     return {
         "question_extracted": extracted_text,
-        "subject": subject,
-        "grade": grade,
+        "detected_type": rich.get("detected_type"),
+        "used_pix2tex": rich.get("used_pix2tex"),
+        "latex": rich.get("latex"),
         "answer": answer,
         "sources": sources,
     }
-
 
 
 # ============ توليد الامتحان (مدرّس فقط) ============
@@ -527,16 +535,18 @@ async def submit_answer_from_file(
     file_bytes = await file.read()
     filename = file.filename.lower()
 
-    # لو صورة → ندمج GCV + pix2tex في نص واحد
     if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        rich = extract_rich_from_image_google(file_bytes, enable_math=True)
+        rich = extract_rich_from_image_google(file_bytes)
         student_answer_text = rich["merged"]
         latex = rich["latex"]
 
-    # لو PDF → نص فقط
     elif filename.endswith(".pdf"):
         student_answer_text = extract_text_from_pdf_google(file_bytes)
         latex = None
+        rich = {
+            "detected_type": "text",
+            "used_pix2tex": False,
+        }
 
     else:
         raise HTTPException(400, "Unsupported file type")
@@ -552,9 +562,10 @@ async def submit_answer_from_file(
 
     return {
         "question": question,
+        "detected_type": rich.get("detected_type"),
+        "used_pix2tex": rich.get("used_pix2tex"),
         "student_answer_extracted": student_answer_text,
         "student_answer_latex": latex,
-        "model_answer": model_answer,
         "grading_result": grading_result,
     }
 
@@ -685,320 +696,28 @@ async def submit_math_answer_from_file(
 
 
 
-# from typing import List, Optional, Literal
-
-# from fastapi import FastAPI, HTTPException
-# from pydantic import BaseModel
-
-# from rag.rag_pipeline import RAGPipeline
-# from rag.grading_engine import GradingEngine
-# from rag.exam_engine import ExamEngine
-# from rag.student_record import StudentRecordManager
-# from rag.config import SUBJECTS, GRADES
-
-# app = FastAPI(
-#     title="Educational RAG API",
-#     version="4.0.0",
-#     description=(
-#         "نظام تعليمي يعتمد RAG + Groq + ChromaDB، "
-#         "مع دعم الأسئلة المباشرة، التصحيح النصي، ونظام امتحانات كامل."
-#     ),
-# )
-
-# # ====== الكيانات الأساسية ======
-
-# rag = RAGPipeline()
-# grading_engine = GradingEngine()
-# exam_engine = ExamEngine()
-# student_records = StudentRecordManager()
-
-
-# # ====== موديلات الأسئلة ======
-
-# class QuestionRequest(BaseModel):
-#     question: str
-#     subject: str
-#     grade: str
-
-# # ====== موديلات الامتحان ======
-
-# class GeneratedQuestion(BaseModel):
-#     id: int
-#     type: Literal["mcq", "open"]
-#     question: str
-#     options: Optional[List[str]] = None
-#     correct_option_index: Optional[int] = None
-#     model_answer: str
-
-
-# class GeneratedExam(BaseModel):
-#     subject: str
-#     grade: str
-#     questions: List[GeneratedQuestion]
-
-
-# class GenerateExamRequest(BaseModel):
-#     subject: str
-#     grade: str
-#     num_questions: int = 5
-
-
-# class StudentAnswer(BaseModel):
-#     question_id: int
-#     selected_option_index: Optional[int] = None  # لأسئلة MCQ
-#     answer_text: Optional[str] = None           # لأسئلة open
-
-
-# class ExamSubmission(BaseModel):
-#     student_id: str
-#     exam: GeneratedExam
-#     answers: List[StudentAnswer]
-
-# # ====== Endpoints أساسية ======
-
-# @app.get("/subjects")
-# def list_subjects():
-#     return SUBJECTS
-
-# @app.get("/grades")
-# def list_grades():
-#     return GRADES
-
-# @app.post("/ask")
-# def ask(req: QuestionRequest):
-#     subject = req.subject.lower().strip()
-#     grade = req.grade.lower().strip()
-
-#     if subject not in SUBJECTS:
-#         raise HTTPException(400, "Invalid subject")
-
-#     if grade not in GRADES:
-#         raise HTTPException(400, "Invalid grade")
-
-#     answer, sources = rag.answer(req.question, subject, grade)
-
-#     return {
-#         "question": req.question,
-#         "subject": subject,
-#         "grade": grade,
-#         "answer": answer,
-#         "sources": sources
-#     }
-
-# @app.post("/grade")
-# def grade_answer(req: dict):
-#     """
-#     {
-#       "question": "...",
-#       "student_answer": "...",
-#       "subject": "...",
-#       "grade": "..."
-#     }
-#     """
-
-#     question = req["question"]
-#     student_answer = req["student_answer"]
-#     subject = req["subject"].lower()
-#     grade = req["grade"].lower()
-
-#     # 1️⃣ نحصل على الإجابة النموذجية عبر RAG
-#     model_answer, _ = rag.answer(question, subject, grade)
-
-#     # 2️⃣ نُرسل الإجابتين إلى محرك التصحيح
-#     grading_result = grading_engine.grade(
-#         question=question,
-#         student_answer=student_answer,
-#         model_answer=model_answer
-#     )
-
-#     return {
-#         "question": question,
-#         "student_answer": student_answer,
-#         "model_answer": model_answer,
-#         "grading_result": grading_result
-#     }
-
-
-
-# # ======  توليد الامتحان ======
-
-# @app.post("/generate_exam", response_model=GeneratedExam)
-# def generate_exam(req: GenerateExamRequest):
-#     subject = req.subject.lower().strip()
-#     grade = req.grade.lower().strip()
-
-#     if subject not in SUBJECTS:
-#         raise HTTPException(400, "Invalid subject")
-
-#     if grade not in GRADES:
-#         raise HTTPException(400, "Invalid grade")
-
-#     raw_exam = exam_engine.generate_exam(subject, grade, req.num_questions)
-
-#     if "error" in raw_exam:
-#         # إرجاع الخطأ الخام لو حصلت مشكلة في JSON
-#         raise HTTPException(
-#             status_code=500,
-#             detail={
-#                 "message": "Exam generation failed",
-#                 "error": raw_exam.get("error"),
-#                 "raw_output": raw_exam.get("raw_output"),
-#             },
-#         )
-
-#     questions = []
-#     for q in raw_exam["questions"]:
-#         try:
-#             questions.append(
-#                 GeneratedQuestion(
-#                     id=int(q.get("id")),
-#                     type=q.get("type"),
-#                     question=q.get("question"),
-#                     options=q.get("options"),
-#                     correct_option_index=q.get("correct_option_index"),
-#                     model_answer=q.get("model_answer"),
-#                 )
-#             )
-#         except Exception as e:
-#             print("Question parse error:", e, q)
-#             continue
-
-#     if not questions:
-#         raise HTTPException(500, "No valid questions generated")
-
-#     return GeneratedExam(subject=subject, grade=grade, questions=questions)
-
-
-# # ======  تصحيح امتحان كامل ======
-
-# @app.post("/submit_exam")
-# def submit_exam(submission: ExamSubmission):
-#     exam = submission.exam
-#     answers = submission.answers
-
-#     # نبني قاموس من id -> سؤال
-#     question_map = {q.id: q for q in exam.questions}
-
-#     per_question_results = []
-#     total_score = 0.0
-#     question_count = 0
-
-#     for ans in answers:
-#         q = question_map.get(ans.question_id)
-#         if not q:
-#             # تجاهل سؤال غير معروف
-#             continue
-
-#         question_count += 1
-
-#         if q.type == "mcq":
-#             # تصحيح اختيار من متعدد
-#             if ans.selected_option_index is None:
-#                 score = 0
-#                 is_correct = False
-#                 feedback = "لم يتم اختيار أي خيار."
-#             else:
-#                 is_correct = ans.selected_option_index == q.correct_option_index
-#                 score = 100 if is_correct else 0
-#                 feedback = "إجابة صحيحة." if is_correct else "إجابة خاطئة."
-
-#             student_repr = None
-#             if ans.selected_option_index is not None and q.options:
-#                 idx = ans.selected_option_index
-#                 if 0 <= idx < len(q.options):
-#                     student_repr = q.options[idx]
-#                 else:
-#                     student_repr = f"خيار رقم {idx}"
-
-#             per_question_results.append(
-#                 {
-#                     "question_id": q.id,
-#                     "type": q.type,
-#                     "question": q.question,
-#                     "student_answer": student_repr,
-#                     "model_answer": q.model_answer,
-#                     "score": score,
-#                     "is_correct": is_correct,
-#                     "feedback": feedback,
-#                 }
-#             )
-#             total_score += score
-
-#         elif q.type == "open":
-#             # تصحيح سؤال مفتوح باستخدام GradingEngine
-#             if not ans.answer_text:
-#                 grading_result = {
-#                     "score": 0,
-#                     "is_correct": False,
-#                     "feedback": "لا توجد إجابة من الطالب.",
-#                     "correct_answer": q.model_answer,
-#                 }
-#             else:
-#                 grading_result = grading_engine.grade(
-#                     question=q.question,
-#                     student_answer=ans.answer_text,
-#                     model_answer=q.model_answer,
-#                 )
-
-#             per_question_results.append(
-#                 {
-#                     "question_id": q.id,
-#                     "type": q.type,
-#                     "question": q.question,
-#                     "student_answer": ans.answer_text,
-#                     "model_answer": q.model_answer,
-#                     "score": grading_result.get("score", 0),
-#                     "is_correct": grading_result.get("is_correct", False),
-#                     "feedback": grading_result.get("feedback", ""),
-#                 }
-#             )
-#             total_score += grading_result.get("score", 0)
-
-#         else:
-#             # نوع سؤال غير معروف
-#             per_question_results.append(
-#                 {
-#                     "question_id": q.id,
-#                     "type": q.type,
-#                     "question": q.question,
-#                     "student_answer": None,
-#                     "model_answer": q.model_answer,
-#                     "score": 0,
-#                     "is_correct": False,
-#                     "feedback": "نوع سؤال غير مدعوم.",
-#                 }
-#             )
-
-#     if question_count == 0:
-#         raise HTTPException(400, "No valid answers/questions to grade")
-
-#     exam_score = total_score / question_count
-
-#     result = {
-#     "subject": exam.subject,
-#     "grade": exam.grade,
-#     "num_questions": question_count,
-#     "total_score": exam_score,
-#     "questions": per_question_results,
-#     }
-
-#     # ✅ حفظ النتيجة في سجل الطالب
-#     student_id = submission.dict().get("student_id", "anonymous")
-#     student_records.add_exam_result(student_id, result)
-
-#     return result
-
-
-# # ====== عرض سجل الطالب ======
-
-# @app.get("/student/{student_id}")
-# def get_student_record(student_id: str):
-#     record = student_records.get_student_record(student_id)
-#     if not record:
-#         raise HTTPException(404, "Student not found")
-#     return record
-
-
-# @app.get("/student/{student_id}/stats")
-# def get_student_stats(student_id: str):
-#     return student_records.get_student_stats(student_id)
+@app.post("/grade_math_steps")
+def grade_math_steps(
+    req: MathStepsRequest,
+    current_student: Dict[str, Any] = Depends(get_current_student),
+):
+    """
+    تصحيح حل رياضي خطوة بخطوة.
+    مثال للـ JSON:
+
+    {
+      "question": "حل المعادلة 2x + 3 = 7",
+      "correct_answer": "x = 2",
+      "student_steps": [
+        "2x + 3 = 7",
+        "2x = 4",
+        "x = 2"
+      ]
+    }
+    """
+    result = math_step_grader.grade_steps(
+        question=req.question,
+        student_steps=req.student_steps,
+        correct_answer=req.correct_answer,
+    )
+    return result

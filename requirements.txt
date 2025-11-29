@@ -15,3 +15,4 @@ pdfplumber
 python-multipart
 pix2tex
 Pillow
+sympy
