@@ -13,3 +13,5 @@ httpx
 google-cloud-vision
 pdfplumber
 python-multipart
+pix2tex
+Pillow

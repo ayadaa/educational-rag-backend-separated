@@ -17,9 +17,12 @@ from rag.google_oauth import (
     get_google_user_info,
 )
 from rag.file_processor import (
-    extract_text_from_image_google,
-    extract_text_from_pdf_google
+    # extract_text_from_image_google,
+    extract_text_from_pdf_google,
+    extract_rich_from_image_google
 )
+from rag.math_ocr import image_to_latex
+from rag.groq_client import GroqClient
 
 
 app = FastAPI(
@@ -87,6 +90,7 @@ grading_engine = GradingEngine()
 exam_engine = ExamEngine()
 student_records = StudentRecordManager()
 token_blacklist = TokenBlacklist()
+math_llm = GroqClient()
 
 
 # ============ موديلات عامة ============
@@ -314,14 +318,23 @@ async def ask_from_file(
     file_bytes = await file.read()
     filename = file.filename.lower()
 
+    # لو كانت صورة → استخدم GCV + pix2tex معًا
     if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        extracted_text = extract_text_from_image_google(file_bytes)
+        rich = extract_rich_from_image_google(
+            file_bytes,
+            enable_math=True if subject.lower() in ["math", "physics"] else False
+        )
+        extracted_text = rich["merged"]
 
+    # لو PDF → نكتفي بنص GCV من الـ PDF
     elif filename.endswith(".pdf"):
         extracted_text = extract_text_from_pdf_google(file_bytes)
 
     else:
         raise HTTPException(400, "Unsupported file type")
+
+    if not extracted_text:
+        raise HTTPException(400, "لم يتم التعرف على أي نص من الملف المرفوع.")
 
     answer, sources = rag.answer(extracted_text, subject, grade)
 
@@ -332,6 +345,7 @@ async def ask_from_file(
         "answer": answer,
         "sources": sources,
     }
+
 
 
 # ============ توليد الامتحان (مدرّس فقط) ============
@@ -513,14 +527,22 @@ async def submit_answer_from_file(
     file_bytes = await file.read()
     filename = file.filename.lower()
 
+    # لو صورة → ندمج GCV + pix2tex في نص واحد
     if filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        student_answer_text = extract_text_from_image_google(file_bytes)
+        rich = extract_rich_from_image_google(file_bytes, enable_math=True)
+        student_answer_text = rich["merged"]
+        latex = rich["latex"]
 
+    # لو PDF → نص فقط
     elif filename.endswith(".pdf"):
         student_answer_text = extract_text_from_pdf_google(file_bytes)
+        latex = None
 
     else:
         raise HTTPException(400, "Unsupported file type")
+
+    if not student_answer_text:
+        raise HTTPException(400, "لم يتم التعرف على أي نص من إجابة الطالب.")
 
     grading_result = grading_engine.grade(
         question=question,
@@ -531,6 +553,7 @@ async def submit_answer_from_file(
     return {
         "question": question,
         "student_answer_extracted": student_answer_text,
+        "student_answer_latex": latex,
         "model_answer": model_answer,
         "grading_result": grading_result,
     }
@@ -571,6 +594,94 @@ def get_my_stats(current_student: Dict[str, Any] = Depends(get_current_student))
     student_id = current_student["username"]
     return student_records.get_student_stats(student_id)
 
+
+@app.post("/math_ocr")
+async def math_ocr_endpoint(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    if not filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise HTTPException(400, "هذا المسار خاص بالصور فقط (png/jpg/jpeg/webp).")
+
+    try:
+        latex = image_to_latex(file_bytes)
+    except Exception as e:
+        raise HTTPException(500, f"فشل تحويل الصورة إلى LaTeX: {e}")
+
+    return {
+        "latex": latex
+    }
+
+
+@app.post("/ask_math_file")
+async def ask_math_from_file(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    if not filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise HTTPException(400, "هذا المسار خاص بصور المعادلات (png/jpg/jpeg/webp).")
+
+    try:
+        latex = image_to_latex(file_bytes)
+    except Exception as e:
+        raise HTTPException(500, f"فشل تحويل الصورة إلى LaTeX: {e}")
+
+    # نبني برومبت للـ LLM لحل أو شرح المعادلة
+    system_prompt = (
+        "أنت مدرس رياضيات خبير. "
+        "اكتشفت المعادلة التالية بصيغة LaTeX، أرجو حلها خطوة بخطوة وشرح الخطوات بالعربية."
+    )
+
+    user_prompt = f"المعادلة (LaTeX):\n{latex}\n\nحل المعادلة مع شرح الخطوات."
+
+    answer = math_llm.generate(system_prompt, user_prompt)
+
+    return {
+        "latex": latex,
+        "answer": answer
+    }
+
+
+
+@app.post("/submit_math_answer_file")
+async def submit_math_answer_from_file(
+    question: str,
+    model_answer: str,  # ممكن تكون نصية أو LaTeX
+    file: UploadFile = File(...),
+    current_student: Dict[str, Any] = Depends(get_current_student),
+):
+    file_bytes = await file.read()
+    filename = file.filename.lower()
+
+    if not filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise HTTPException(400, "هذا المسار خاص بصور المعادلات (png/jpg/jpeg/webp).")
+
+    try:
+        student_latex = image_to_latex(file_bytes)
+    except Exception as e:
+        raise HTTPException(500, f"فشل تحويل صورة الطالب إلى LaTeX: {e}")
+
+    # نبني إجابة طالب نصية/رمزية لإرسالها لمحرك التصحيح
+    student_answer_text = f"إجابة الطالب بالصيغة LaTeX: {student_latex}"
+
+    grading_result = grading_engine.grade(
+        question=question,
+        student_answer=student_answer_text,
+        model_answer=model_answer
+    )
+
+    return {
+        "question": question,
+        "student_answer_latex": student_latex,
+        "model_answer": model_answer,
+        "grading_result": grading_result
+    }
 
 
 
