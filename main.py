@@ -1,8 +1,12 @@
 from typing import List, Optional, Literal, Dict, Any
 from datetime import timedelta
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+import os
+# import requests
+# from sqlalchemy.orm import Session
+from jose import jwt, JWTError
 
 from rag.rag_pipeline import RAGPipeline
 from rag.config import SUBJECTS, GRADES
@@ -24,6 +28,34 @@ from rag.file_processor import (
 from rag.math_ocr import image_to_latex
 from rag.groq_client import GroqClient
 from rag.math_step_grader import MathStepGrader
+from rag.auth import refresh_token_manager
+
+from auth.security import ( 
+    hash_password, 
+    verify_password, 
+    create_access_token, 
+    create_refresh_token,
+    SECRET_KEY,
+    REFRESH_SECRET_KEY,
+    ALGORITHM,
+)
+from auth.schemas import RegisterSchema, LoginSchema, RefreshRequest
+# from auth.google_oauth import oauth
+from auth.google_httpx import get_google_login_url
+from auth.dependencies import get_current_user
+from fastapi.responses import RedirectResponse
+
+from db.database import Base, engine
+from db.models.users import User
+from db.models.students import Student
+from db.models.exams import Exam
+from db.models.student_attempts import StudentAttempt
+from db.models.math_steps import MathStep
+from db.models.ocr_logs import OCRLog
+from db.models.refresh_tokens import RefreshToken
+
+from sqlalchemy.orm import Session
+from db.database import SessionLocal
 
 
 app = FastAPI(
@@ -34,6 +66,18 @@ app = FastAPI(
         "مع دعم الحسابات (JWT)، الامتحانات، التصحيح، وسجل الطالب."
     ),
 )
+
+@app.on_event("startup")
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db: Session = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 # ============ OAuth2 / JWT ============
 
@@ -164,33 +208,75 @@ class MathStepsRequest(BaseModel):
 
 # ============ Endpoints الحسابات ============
 
-@app.post("/register", response_model=UserPublic)
-def register(req: RegisterRequest):
-    try:
-        user = user_manager.create_user(req.username, req.password, req.role)
-    except ValueError:
+# @app.post("/register", response_model=UserPublic)
+# def register(req: RegisterRequest):
+#     try:
+#         user = user_manager.create_user(req.username, req.password, req.role)
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail="Username already exists")
+
+#     return UserPublic(
+#         username=user["username"],
+#         role=user["role"],
+#         created_at=user["created_at"],
+#     )
+
+@app.post("/register")
+def register(data: RegisterSchema, db: Session = Depends(get_db)):
+    user_exists = db.query(User).filter(User.username == data.username).first()
+    if user_exists:
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    return UserPublic(
-        username=user["username"],
-        role=user["role"],
-        created_at=user["created_at"],
+    new_user = User(
+        username=data.username,
+        password_hash=hash_password(data.password),
+        role=data.role
     )
 
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
 
-from rag.auth import refresh_token_manager
+    return {
+        "message": "User registered successfully ✅",
+        "user_id": new_user.id
+    }
+
+
+# @app.post("/login")
+# def login(form_data: OAuth2PasswordRequestForm = Depends()):
+#     user = user_manager.verify_user(form_data.username, form_data.password)
+#     if not user:
+#         raise HTTPException(status_code=400, detail="Incorrect username or password")
+
+#     access_token = create_access_token(
+#         {"sub": user["username"], "role": user["role"]},
+#         expires_delta=timedelta(minutes=15),  # ✅ قصير
+#     )
+
+#     refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+
+#     return {
+#         "access_token": access_token,
+#         "refresh_token": refresh_token,
+#         "token_type": "bearer"
+#     }
+
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = user_manager.verify_user(form_data.username, form_data.password)
+def login(data: LoginSchema, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == data.username).first()
     if not user:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
+        raise HTTPException(status_code=400, detail="Invalid credentials")
 
-    access_token = create_access_token(
-        {"sub": user["username"], "role": user["role"]},
-        expires_delta=timedelta(minutes=15),  # ✅ قصير
-    )
+    if not verify_password(data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
 
-    refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+    access_token = create_access_token({"sub": user.username, "role": user.role})
+    refresh_token = create_refresh_token({"sub": user.username})
+
+    token_db = RefreshToken(user_id=user.id, token=refresh_token)
+    db.add(token_db)
+    db.commit()
 
     return {
         "access_token": access_token,
@@ -198,79 +284,280 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         "token_type": "bearer"
     }
 
-
 # =========== Google OAuth Endpoints ============
 
-@app.get("/auth/google/login")
+# @app.get("/auth/google/login")
+# def google_login():
+#     return {
+#         "login_url": get_google_login_url()
+#     }
+
+
+# @app.get("/auth/google")
+# async def google_login(request: Request):
+#     redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+#     return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/google")
 def google_login():
-    return {
-        "login_url": get_google_login_url()
-    }
+    url = get_google_login_url()
+    return RedirectResponse(url)
+
+
+# @app.get("/auth/google/callback")
+# async def google_callback(code: str):
+#     token_data = await exchange_code_for_token(code)
+#     access_token = token_data["access_token"]
+
+#     user_info = await get_google_user_info(access_token)
+#     email = user_info.get("email")
+
+#     if not email:
+#         raise HTTPException(400, "Google account has no email")
+
+#     user = user_manager.get_or_create_google_user(email)
+
+#     jwt_access = create_access_token(
+#         {"sub": user["username"], "role": user["role"]},
+#         expires_delta=timedelta(minutes=15),
+#     )
+
+#     refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+
+#     return {
+#         "access_token": jwt_access,
+#         "refresh_token": refresh_token,
+#         "token_type": "bearer",
+#         "user": {
+#             "username": user["username"],
+#             "role": user["role"],
+#         }
+#     }
+
+
+# @app.get("/auth/google/callback")
+# async def google_callback(request: Request, db: Session = Depends(get_db)):
+#     token = await oauth.google.authorize_access_token(request)
+#     user_info = token.get("userinfo")
+
+#     google_id = user_info["sub"]
+#     email = user_info["email"]
+
+#     # ✅ البحث عن المستخدم
+#     user = db.query(User).filter(User.google_id == google_id).first()
+
+#     # ✅ إذا لم يكن موجودًا ننشئه تلقائيًا
+#     if not user:
+#         user = User(
+#             username=email.split("@")[0],
+#             password_hash=None,
+#             role="student",
+#             google_id=google_id,
+#             email=email
+#         )
+#         db.add(user)
+#         db.commit()
+#         db.refresh(user)
+
+#     # ✅ توليد JWT
+#     access_token = create_access_token({"sub": user.id, "role": user.role})
+#     refresh_token = create_refresh_token({"sub": user.id})
+
+#     token_db = RefreshToken(user_id=user.id, token=refresh_token)
+#     db.add(token_db)
+#     db.commit()
+
+#     return {
+#         "message": "Google login successful ✅",
+#         "access_token": access_token,
+#         "refresh_token": refresh_token,
+#         "token_type": "bearer"
+#     }
 
 
 @app.get("/auth/google/callback")
-async def google_callback(code: str):
-    token_data = await exchange_code_for_token(code)
-    access_token = token_data["access_token"]
+async def google_callback(code: str, db: Session = Depends(get_db)):
+    try:
+        # 1️⃣ تبادل code مقابل access_token
+        token_data = await exchange_code_for_token(code)
+        access_token_google = token_data["access_token"]
 
-    user_info = await get_google_user_info(access_token)
-    email = user_info.get("email")
+        # 2️⃣ جلب بيانات المستخدم من Google
+        user_info = await get_google_user_info(access_token_google)
 
-    if not email:
-        raise HTTPException(400, "Google account has no email")
+        google_id = user_info["sub"]
+        email = user_info.get("email")
+        name = user_info.get("name", email)
 
-    user = user_manager.get_or_create_google_user(email)
+        # 3️⃣ البحث عن المستخدم في قاعدة البيانات
+        user = db.query(User).filter(User.google_id == google_id).first()
 
-    jwt_access = create_access_token(
-        {"sub": user["username"], "role": user["role"]},
-        expires_delta=timedelta(minutes=15),
-    )
+        # 4️⃣ إذا لم يكن موجودًا → ننشئه
+        if not user:
+            user = User(
+                username=email.split("@")[0] if email else google_id,
+                email=email,
+                google_id=google_id,
+                role="student",
+                password_hash=None
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
 
-    refresh_token = refresh_token_manager.create_refresh_token(user["username"])
+        # 5️⃣ إنشاء JWT Tokens
+        access_token = create_access_token(
+            {"sub": user.id, "role": user.role}
+        )
+        refresh_token = create_refresh_token(
+            {"sub": user.id}
+        )
 
-    return {
-        "access_token": jwt_access,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "user": {
-            "username": user["username"],
-            "role": user["role"],
+        # 6️⃣ حفظ Refresh Token في DB
+        token_db = RefreshToken(
+            user_id=user.id,
+            token=refresh_token
+        )
+        db.add(token_db)
+        db.commit()
+
+        return {
+            "message": "Google login successful ✅",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
         }
-    }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# @app.post("/refresh")
+# def refresh_token(refresh_token: str):
+#     username = refresh_token_manager.verify_refresh_token(refresh_token)
+#     if not username:
+#         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+#     user = user_manager.get_user(username)
+
+#     new_access_token = create_access_token(
+#         {"sub": user["username"], "role": user["role"]},
+#         expires_delta=timedelta(minutes=15),
+#     )
+
+#     return {
+#         "access_token": new_access_token,
+#         "token_type": "bearer"
+#     }
 
 
 @app.post("/refresh")
-def refresh_token(refresh_token: str):
-    username = refresh_token_manager.verify_refresh_token(refresh_token)
-    if not username:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+def refresh_token_endpoint(
+    data: RefreshRequest,
+    db: Session = Depends(get_db),
+):
+    refresh_token = data.refresh_token
 
-    user = user_manager.get_user(username)
+    # 1) فك تشفير الـ Refresh Token والتأكد من صلاحيته
+    try:
+        payload = jwt.decode(
+            refresh_token,
+            REFRESH_SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid refresh token payload")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
-    new_access_token = create_access_token(
-        {"sub": user["username"], "role": user["role"]},
-        expires_delta=timedelta(minutes=15),
+    # 2) التأكد أن الـ Refresh Token موجود في قاعدة البيانات
+    token_in_db = (
+        db.query(RefreshToken)
+        .filter(
+            RefreshToken.token == refresh_token,
+            RefreshToken.user_id == int(user_id),
+        )
+        .first()
     )
+
+    if not token_in_db:
+        raise HTTPException(status_code=401, detail="Refresh token not found or revoked")
+
+    # 3) جلب المستخدم
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # 4) إصدار Access Token جديد + Refresh Token جديد (تدوير)
+    new_access_token = create_access_token(
+        {"sub": user.id, "role": user.role},
+        minutes=60,   # غيرها كما تريد
+    )
+
+    new_refresh_token = create_refresh_token(
+        {"sub": user.id},
+        days=7,       # غيرها كما تريد
+    )
+
+    # 5) تدوير الـ Refresh Token في قاعدة البيانات
+    token_in_db.token = new_refresh_token
+    db.commit()
 
     return {
         "access_token": new_access_token,
-        "token_type": "bearer"
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
     }
 
+
+# @app.post("/logout")
+# def logout(
+#     token: str = Depends(oauth2_scheme),
+#     current_user: Dict[str, Any] = Depends(get_current_user),
+# ):
+#     token_blacklist.revoke(token)
+    
+#     # ✅ إلغاء كل Refresh Tokens لهذا المستخدم
+#     refresh_token_manager.revoke_user_tokens(current_user["username"])
+
+#     return {
+#         "message": "تم تسجيل الخروج نهائيًا من جميع الجلسات ✅"
+#     }
 
 @app.post("/logout")
 def logout(
-    token: str = Depends(oauth2_scheme),
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    refresh_token: str,
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
-    token_blacklist.revoke(token)
-    
-    # ✅ إلغاء كل Refresh Tokens لهذا المستخدم
-    refresh_token_manager.revoke_user_tokens(current_user["username"])
+    token_in_db = db.query(RefreshToken).filter(
+        RefreshToken.token == refresh_token,
+        RefreshToken.user_id == current_user.id
+    ).first()
 
-    return {
-        "message": "تم تسجيل الخروج نهائيًا من جميع الجلسات ✅"
-    }
+    if not token_in_db:
+        return {"message": "Token already invalid or not found ✅"}
+
+    db.delete(token_in_db)
+    db.commit()
+
+    return {"message": "Logged out successfully ✅"}
+
+
+@app.post("/logout-all")
+def logout_all(
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == current_user.id
+    ).delete()
+
+    db.commit()
+
+    return {"message": "Logged out from all devices ✅"}
 
 
 @app.get("/me", response_model=UserPublic)

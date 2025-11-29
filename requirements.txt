@@ -16,3 +16,7 @@ python-multipart
 pix2tex
 Pillow
 sympy
+psycopg2-binary
+sqlalchemy
+alembic
+authlib
